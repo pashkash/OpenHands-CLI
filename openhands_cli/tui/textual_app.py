@@ -23,7 +23,7 @@ from textual.widgets import Footer, Input, Static, TextArea
 from textual_autocomplete import AutoComplete
 
 from openhands.sdk import BaseConversation
-from openhands.sdk.event import ActionEvent
+from openhands.sdk.event import ActionEvent, MessageEvent
 from openhands.sdk.security.confirmation_policy import (
     AlwaysConfirm,
     ConfirmationPolicyBase,
@@ -990,10 +990,8 @@ class OpenHandsApp(CollapsibleNavigationMixin, App):
     ) -> None:
         """Background thread worker for switching conversations.
 
-        Loads persisted state/events from disk without blocking the UI.
-
-        Note: UI rehydration (history replay) is intentionally tracked separately
-        (see Issue #204) to keep this PR focused.
+        Loads persisted state/events from disk, replays the conversation history
+        in the UI, and finalizes the switch.
         """
         try:
             # Prepare UI first (on main thread) so old content is cleared.
@@ -1003,6 +1001,9 @@ class OpenHandsApp(CollapsibleNavigationMixin, App):
             runner = self.create_conversation_runner(
                 conversation_id=target_id, visualizer=visualizer
             )
+
+            # Replay conversation history in the UI (Issue #204).
+            self._replay_conversation_history(runner, visualizer)
 
             # Finalize on UI thread (set runner, dismiss loading toast).
             self.call_from_thread(self._finish_conversation_switch, runner, target_id)
@@ -1019,6 +1020,83 @@ class OpenHandsApp(CollapsibleNavigationMixin, App):
                 )
 
             self.call_from_thread(_show_error)
+
+    def _replay_conversation_history(
+        self,
+        runner: ConversationRunner,
+        visualizer: ConversationVisualizer,
+    ) -> None:
+        """Replay conversation history events in the UI.
+
+        Renders user messages and agent events from the loaded conversation
+        so the user sees the full chat history when resuming.
+
+        Args:
+            runner: The conversation runner with loaded state.
+            visualizer: The visualizer for rendering agent events.
+        """
+        if not runner.conversation or not runner.conversation.state:
+            return
+
+        events = runner.conversation.state.events
+        if not events:
+            return
+
+        for event in events:
+            # Render user messages as Static widgets (same style as live input).
+            if isinstance(event, MessageEvent):
+                if event.llm_message and event.llm_message.role == "user":
+                    # Extract text content from the message.
+                    text = self._extract_user_message_text(event)
+                    if text:
+                        self.call_from_thread(self._mount_user_message, text)
+                    continue
+
+            # Render agent/system events via the visualizer.
+            # The visualizer handles ActionEvents, ObservationEvents, etc.
+            visualizer.on_event(event)
+
+    def _extract_user_message_text(self, event: MessageEvent) -> str | None:
+        """Extract text content from a user MessageEvent.
+
+        Args:
+            event: A MessageEvent with llm_message.role == "user"
+
+        Returns:
+            The user's message text, or None if not extractable.
+        """
+        if not event.llm_message or not event.llm_message.content:
+            return None
+
+        # Content can be a string or list of content parts.
+        content = event.llm_message.content
+        if isinstance(content, str):
+            return content
+
+        # If it's a list, extract text from TextContent parts.
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                # TextContent has .text attribute, ImageContent does not.
+                text_attr = getattr(part, "text", None)
+                if isinstance(text_attr, str):
+                    text_parts.append(text_attr)
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            return "\n".join(text_parts) if text_parts else None
+
+        return None
+
+    def _mount_user_message(self, text: str) -> None:
+        """Mount a user message widget in the main display.
+
+        Called from the UI thread via call_from_thread.
+
+        Args:
+            text: The user message text to display.
+        """
+        user_message_widget = Static(f"> {text}", classes="user-message", markup=False)
+        self.main_display.mount(user_message_widget)
 
     def _handle_confirmation_request(
         self, pending_actions: list[ActionEvent]
